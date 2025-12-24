@@ -1,0 +1,206 @@
+pipeline {
+    agent any
+
+    parameters {
+        choice(name: 'ACTION', choices: ['Deploy New Version', 'Test Only'], description: 'Choose action')
+        string(name: 'VERSION_TAG', defaultValue: 'v1.0.0', description: 'Tag for the Docker Image')
+        string(name: 'APP_COLOR', defaultValue: '#e0f7fa', description: 'Hex Color for App Background')
+    }
+
+    environment {
+        // Configuration
+        NEXUS_REGISTRY = "registry.nchldemo.com" // REPLACE WITH YOUR NEXUS URL (No http://)
+        NEXUS_CRED     = "nexus-auth"      // ID of Jenkins Credential
+        IMAGE_NAME     = "fintech-python-app"
+        CONTAINER_NAME = "fintech-prod-container"
+        
+        // ZAP Configuration
+        ZAP_PORT       = "9000" // Matches your deployment snippet
+        
+        // Map Cosign Credentials
+        COSIGN_PASSWORD = credentials('cosign-private-key')
+        SONAR_SERVER_NAME = "sonar-server-admin"
+        SONAR_PROJECT_KEY = "fintech-app-trainer"
+    }
+
+    stages {
+        stage('Install Dependencies & Test') {
+            steps {
+                script {
+                    echo "--- Installing Dependencies (Local for Analysis) ---"
+                    // We need to run tests LOCALLY (not in docker yet) to generate 
+                    // the coverage.xml file for SonarQube to read.
+                    // Ideally use a virtualenv, but for lab simplicity:
+                    sh 'pip install -r requirements.txt'
+                    
+                    echo "--- Running Unit Tests with Coverage ---"
+                    // Generates coverage.xml
+                    sh 'pytest --cov=app --cov-report=xml test_app.py'
+                }
+            }
+        }
+
+        stage('SonarQube Analysis') {
+            steps {
+                script {
+                    echo "--- Starting Static Code Analysis ---"
+                    withSonarQubeEnv("${SONAR_SERVER_NAME}") {
+                        sh """
+                        sonar-scanner \
+                          -Dsonar.projectKey=${SONAR_PROJECT_KEY} \
+                          -Dsonar.sources=. \
+                          -Dsonar.python.coverage.reportPaths=coverage.xml \
+                          -Dsonar.exclusions=venv/**,tests/**
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Build Docker Image') {
+            steps {
+                script {
+                    echo "--- Building Docker Image ---"
+                    docker.build("${NEXUS_REGISTRY}/${IMAGE_NAME}:${params.VERSION_TAG}")
+                }
+            }
+        }
+
+        stage('Security Scan (Trivy)') {
+            steps {
+                script {
+                    echo "--- Scanning Image with Trivy ---"
+                    // Scans the local image. 
+                    // --exit-code 0 means "Report only, don't fail build" (Good for labs)
+                    // --severity HIGH,CRITICAL filters the noise
+                    sh "trivy image --exit-code 0 --severity HIGH,CRITICAL --format table ${NEXUS_REGISTRY}/${IMAGE_NAME}:${params.VERSION_TAG}"
+                }
+            }
+        }
+
+        stage('Generate SBOM (Syft)') {
+            steps {
+                script {
+                    echo "--- Generating SBOM ---"
+                    sh "syft ${NEXUS_REGISTRY}/${IMAGE_NAME}:${params.VERSION_TAG} -o cyclonedx-json > sbom.json"
+                }
+            }
+        }
+
+        stage('Push to Nexus') {
+            when { expression { params.ACTION == 'Deploy New Version' } }
+            steps {
+                script {
+                    echo "--- Pushing to Nexus Registry ---"
+                    docker.withRegistry("http://${NEXUS_REGISTRY}", "${NEXUS_CRED}") {
+                        docker.image("${NEXUS_REGISTRY}/${IMAGE_NAME}:${params.VERSION_TAG}").push()
+                    }
+                }
+            }
+        }
+
+        stage('Sign Image (Cosign)') {
+            when { expression { params.ACTION == 'Deploy New Version' } }
+            steps {
+                withCredentials([file(credentialsId: 'cosign-key', variable: 'COSIGN_KEY_FILE'), usernamePassword(credentialsId: "${NEXUS_CRED}", usernameVariable: 'NEXUS_USER', passwordVariable: 'NEXUS_PASS')]) {
+                    script {
+                        echo "--- Signing Image in Nexus ---"
+                        // 1. Login Cosign to Nexus (Required to attach signature)
+                        sh "cosign login ${NEXUS_REGISTRY} -u ${NEXUS_USER} -p ${NEXUS_PASS}"
+                        
+                        // 2. Sign the remote image
+                        sh """
+                           cosign sign --key ${COSIGN_KEY_FILE} \
+                           --tlog-upload=false \
+                           -y \
+                           ${NEXUS_REGISTRY}/${IMAGE_NAME}:${params.VERSION_TAG}
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Deploy to Environment') {
+            when { expression { params.ACTION == 'Deploy New Version' } }
+            steps {
+                script {
+                    echo "Starting Deployment for Tag: ${params.VERSION_TAG}..."
+                    
+                    // Cleanup old container
+                    sh "docker rm -f ${CONTAINER_NAME} || true"
+
+                    def envColor = params.APP_COLOR
+                    def envVersion = params.VERSION_TAG
+
+                    docker.withRegistry("http://${NEXUS_REGISTRY}", "${NEXUS_CRED}") {
+                        // Pull logic ensures we use the registry version
+                        sh "docker pull ${NEXUS_REGISTRY}/${IMAGE_NAME}:${params.VERSION_TAG}"
+                        
+                        sh """
+                            docker run -d \
+                            --name ${CONTAINER_NAME} \
+                            -p ${ZAP_PORT}:8080 \
+                            -e APP_VERSION="${envVersion}" \
+                            -e BG_COLOR="${envColor}" \
+                            ${NEXUS_REGISTRY}/${IMAGE_NAME}:${params.VERSION_TAG}
+                        """
+                    }
+                    
+                    // Wait for app to boot before ZAP scans it
+                    sh "sleep 5"
+                }
+            }
+        }
+
+        stage('DAST Scan (OWASP ZAP)') {
+            when { expression { params.ACTION == 'Deploy New Version' } }
+            steps {
+                script {
+                    echo "--- Running OWASP ZAP Scan ---"
+                    // Get the Gateway IP (Host IP) so the Docker container can see the App
+                    def hostIP = "host.docker.internal" 
+                    // Note: On Linux, 'host.docker.internal' might require '--add-host' flag. 
+                    // If Jenkins is on Linux, easier to use the specific IP or network.
+                    // For this lab, assuming Linux agent, we use the Network Gateway or IP.
+                    
+                    // Simplified: We use a lightweight ZAP run via Docker
+                    // We mount the current directory ($(pwd)) to /zap/wrk to save the report
+                    
+                    try {
+                        sh """
+                        docker run --rm \
+                        -v \$(pwd):/zap/wrk/:rw \
+                        -t owasp/zap2docker-stable zap-baseline.py \
+                        -t http://\$(ip -4 addr show docker0 | grep -oP '(?<=inet\\s)\\d+(\\.\\d+){3}'):${ZAP_PORT} \
+                        -r zap_report.html \
+                        || true 
+                        """
+                        // || true prevents pipeline failure if vulnerabilities are found (typical for Baseline scans)
+                    } catch (Exception e) {
+                        echo "ZAP Warning: Ensure Docker networking allows container-to-host communication."
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            // Publish ZAP HTML Report
+            publishHTML (target : [
+                allowMissing: true,
+                alwaysLinkToLastBuild: true,
+                keepAll: true,
+                reportDir: '.',
+                reportFiles: 'zap_report.html',
+                reportName: 'OWASP ZAP Report'
+            ])
+            
+            // Archive SBOM
+            archiveArtifacts artifacts: 'sbom.json', fingerprint: true
+            
+            // Cleanup
+            cleanWs()
+        }
+    }
+}
