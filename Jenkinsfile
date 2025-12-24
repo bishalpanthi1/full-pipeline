@@ -100,17 +100,17 @@ pipeline {
             }
         }
 
-        // stage('Push to Nexus') {
-        //     when { expression { params.ACTION == 'Deploy New Version' } }
-        //     steps {
-        //         script {
-        //             echo "--- Pushing to Nexus Registry ---"
-        //             docker.withRegistry("http://${NEXUS_REGISTRY}", "${NEXUS_CRED}") {
-        //                 docker.image("${NEXUS_REGISTRY}/${IMAGE_NAME}:${params.VERSION_TAG}").push()
-        //             }
-        //         }
-        //     }
-        // }
+        stage('Push to Nexus') {
+            when { expression { params.ACTION == 'Deploy New Version' } }
+            steps {
+                script {
+                    echo "--- Pushing to Nexus Registry ---"
+                    docker.withRegistry("http://${NEXUS_REGISTRY}", "${NEXUS_CRED}") {
+                        docker.image("${NEXUS_REGISTRY}/${IMAGE_NAME}:${params.VERSION_TAG}").push()
+                    }
+                }
+            }
+        }
 
         // stage('Sign Image (Cosign)') {
         //     when { expression { params.ACTION == 'Deploy New Version' } }
