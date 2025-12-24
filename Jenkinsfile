@@ -215,7 +215,7 @@ pipeline {
                 allowMissing: true,
                 alwaysLinkToLastBuild: true,
                 keepAll: true,
-                reportDir: '.',
+                reportDir: 'zap-wrk',          // <--- CHANGED: Look inside the sub-folder
                 reportFiles: 'zap_report.html',
                 reportName: 'OWASP ZAP Report'
             ])
@@ -223,7 +223,7 @@ pipeline {
             // Archive SBOM
             archiveArtifacts artifacts: 'sbom.json', fingerprint: true
             archiveArtifacts artifacts: 'sbom.txt', fingerprint: true
-            archiveArtifacts artifacts: 'zap_report.html', fingerprint: true
+            archiveArtifacts artifacts: 'zap-wrk/zap_report.html', fingerprint: true
 
             
             // // Cleanup
